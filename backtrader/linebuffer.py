@@ -220,8 +220,9 @@ class LineBuffer(LineSingle):
             value (variable): value to be set
         '''
         self.array[self.idx + ago] = value
-        for binding in self.bindings:
-            binding[ago] = value
+        if self.bindings:
+            for binding in self.bindings:
+                binding[ago] = value
 
     def set(self, value, ago=0):
         ''' Sets a value at position "ago" and executes any associated bindings
@@ -232,8 +233,9 @@ class LineBuffer(LineSingle):
             the slice
         '''
         self.array[self.idx + ago] = value
-        for binding in self.bindings:
-            binding[ago] = value
+        if self.bindings:
+            for binding in self.bindings:
+                binding[ago] = value
 
     def home(self):
         ''' Rewinds the logical index to the beginning
@@ -254,8 +256,10 @@ class LineBuffer(LineSingle):
         self.idx += size
         self.lencount += size
 
-        for i in range(size):
+        if size == 1:
             self.array.append(value)
+        else:
+            self.array.extend([value] * size)
 
     def backwards(self, size=1, force=False):
         ''' Moves the logical index backwards and reduces the buffer as much as needed
@@ -267,8 +271,10 @@ class LineBuffer(LineSingle):
         # Go directly to property setter to support force
         self.set_idx(self._idx - size, force=force)
         self.lencount -= size
-        for i in range(size):
+        if size == 1:
             self.array.pop()
+        else:
+            del self.array[-size:]
 
     def rewind(self, size=1):
         self.idx -= size
@@ -294,8 +300,10 @@ class LineBuffer(LineSingle):
         set values in the buffer "future"
         '''
         self.extension += size
-        for i in range(size):
+        if size == 1:
             self.array.append(value)
+        else:
+            self.array.extend([value] * size)
 
     def addbinding(self, binding):
         ''' Adds another line binding

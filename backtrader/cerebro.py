@@ -1500,16 +1500,20 @@ class Cerebro(with_metaclass(MetaParams, object)):
         Actual implementation of run in full next mode. All objects have its
         ``next`` method invoke on each data arrival
         '''
+        # Sort datas once — order is static for the entire run
         datas = sorted(self.datas,
                        key=lambda x: (x._timeframe, x._compression))
         datas1 = datas[1:]
         data0 = datas[0]
         d0ret = True
 
+        # Pre-compute static index lists — resampling/replaying status
+        # does not change mid-run
         rs = [i for i, x in enumerate(datas) if x.resampling]
         rp = [i for i, x in enumerate(datas) if x.replaying]
         rsonly = [i for i, x in enumerate(datas)
                   if x.resampling and not x.replaying]
+        rsonly_set = frozenset(rsonly)
         onlyresample = len(datas) == len(rsonly)
         noresample = not rsonly
 
@@ -1560,7 +1564,7 @@ class Cerebro(with_metaclass(MetaParams, object)):
                     dt0 = min((d for d in dts if d is not None))
                 else:
                     dt0 = min((d for i, d in enumerate(dts)
-                               if d is not None and i not in rsonly))
+                               if d is not None and i not in rsonly_set))
 
                 dmaster = datas[dts.index(dt0)]  # and timemaster
                 self._dtmaster = dmaster.num2date(dt0)

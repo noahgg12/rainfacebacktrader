@@ -1052,6 +1052,8 @@ class BackBroker(bt.BrokerBase):
         pclose = getattr(data, 'tick_close', None)
         if pclose is None:
             pclose = data.close[0]
+        # Note: getattr with None check preserved for tick_* attributes
+        # which may be explicitly set to 0.0 for tick data
 
         pcreated = order.created.price
         plimit = order.created.pricelimit
@@ -1181,10 +1183,13 @@ class BackBroker(bt.BrokerBase):
             self.check_submitted()
 
         # Discount any cash for positions hold
+        # Cache comminfo lookups — reused in post-execution adjustment below
         credit = 0.0
+        _comminfo_cache = {}
         for data, pos in self.positions.items():
             if pos:
                 comminfo = self.getcommissioninfo(data)
+                _comminfo_cache[data] = comminfo
                 dt0 = data.datetime.datetime()
                 dcredit = comminfo.get_credit_interest(data, pos, dt0)
                 self.d_credit[data] += dcredit
@@ -1223,7 +1228,7 @@ class BackBroker(bt.BrokerBase):
         for data, pos in self.positions.items():
             # futures change cash every bar
             if pos:
-                comminfo = self.getcommissioninfo(data)
+                comminfo = _comminfo_cache.get(data) or self.getcommissioninfo(data)
                 self.cash += comminfo.cashadjust(pos.size,
                                                  pos.adjbase,
                                                  data.close[0])

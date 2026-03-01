@@ -266,9 +266,18 @@ class Strategy(with_metaclass(MetaStrategy, StrategyBase)):
             l.append(obs)
 
     def _getminperstatus(self):
+        # Once min period is reached (status < 0), it stays negative for the
+        # rest of the run — skip recalculation on every subsequent bar
+        if self._minperiod_reached:
+            return self._minperstatus
+
         # check the min period status connected to datas
         dlens = map(operator.sub, self._minperiods, map(len, self.datas))
         self._minperstatus = minperstatus = max(dlens)
+
+        if minperstatus < 0:
+            self._minperiod_reached = True
+
         return minperstatus
 
     def prenext_open(self):
@@ -396,6 +405,11 @@ class Strategy(with_metaclass(MetaStrategy, StrategyBase)):
         for analyzer in itertools.chain(self.analyzers, self._slave_analyzers):
             analyzer._start()
 
+        # Cache the combined analyzer list to avoid repeated chain() calls
+        # in the hot notification path (_notify is called every bar)
+        self._all_analyzers = list(
+            itertools.chain(self.analyzers, self._slave_analyzers))
+
         for obs in self.observers:
             if not isinstance(obs, list):
                 obs = [obs]  # support of multi-data observers
@@ -409,6 +423,7 @@ class Strategy(with_metaclass(MetaStrategy, StrategyBase)):
         self._dlens = [len(data) for data in self.datas]
 
         self._minperstatus = MAXINT  # start in prenext
+        self._minperiod_reached = False  # for _getminperstatus cache
 
         self.start()
 
@@ -585,17 +600,18 @@ class Strategy(with_metaclass(MetaStrategy, StrategyBase)):
             procorders = self._orderspending
             proctrades = self._tradespending
 
+        # Use cached analyzer list instead of itertools.chain() per call
+        all_analyzers = self._all_analyzers
+
         for order in procorders:
             if order.exectype != order.Historical or order.histnotify:
                 self.notify_order(order)
-            for analyzer in itertools.chain(self.analyzers,
-                                            self._slave_analyzers):
+            for analyzer in all_analyzers:
                 analyzer._notify_order(order)
 
         for trade in proctrades:
             self.notify_trade(trade)
-            for analyzer in itertools.chain(self.analyzers,
-                                            self._slave_analyzers):
+            for analyzer in all_analyzers:
                 analyzer._notify_trade(trade)
 
         if qorders:
@@ -608,7 +624,7 @@ class Strategy(with_metaclass(MetaStrategy, StrategyBase)):
 
         self.notify_cashvalue(cash, value)
         self.notify_fund(cash, value, fundvalue, fundshares)
-        for analyzer in itertools.chain(self.analyzers, self._slave_analyzers):
+        for analyzer in all_analyzers:
             analyzer._notify_cashvalue(cash, value)
             analyzer._notify_fund(cash, value, fundvalue, fundshares)
 
