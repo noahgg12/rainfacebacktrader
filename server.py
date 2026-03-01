@@ -4,6 +4,8 @@ Rainface Backtrader API Server
 FastAPI server that wraps the backtrader engine for Rainface.
 Run with: python server.py
 """
+import io
+import logging
 import os
 import sys
 import csv
@@ -22,7 +24,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from fastapi.responses import StreamingResponse
+
 from strategies import STRATEGY_REGISTRY
+
+logger = logging.getLogger("rainface.backtrader")
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -182,8 +188,8 @@ def _fetch_yahoo_daily_rows(symbol: str, start: str, end: str, adjusted: bool) -
         detail = ""
         try:
             detail = exc.read().decode("utf-8").strip()
-        except Exception:
-            pass
+        except (IOError, UnicodeDecodeError) as read_exc:
+            logger.debug("Could not read Yahoo error response body: %s", read_exc)
         raise RuntimeError(f"Yahoo HTTP {exc.code}: {detail or exc.reason}")
     except URLError as exc:
         raise RuntimeError(f"Yahoo request failed: {exc.reason}")
@@ -257,8 +263,8 @@ def _fetch_massive_daily_rows(ticker: str, start: str, end: str, api_key: str, a
             detail = ""
             try:
                 detail = exc.read().decode("utf-8").strip()
-            except Exception:
-                pass
+            except (IOError, UnicodeDecodeError) as read_exc:
+                logger.debug("Could not read Massive error response body: %s", read_exc)
             if exc.code == 401:
                 raise RuntimeError("HTTP 401 Unauthorized. Verify Massive API key.")
             raise RuntimeError(f"HTTP {exc.code}: {detail or exc.reason}")
@@ -470,7 +476,8 @@ def import_data_files(req: DataImportRequest):
                     )
                     if rows:
                         source_provider = "yahoo"
-                except Exception as exc:
+                except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                    logger.warning("Yahoo fetch failed for %s: %s", clean_symbol, exc)
                     provider_errors.append(f"yahoo: {exc}")
 
             if not rows and provider in {"auto", "massive"}:
@@ -487,7 +494,8 @@ def import_data_files(req: DataImportRequest):
                         )
                         if rows:
                             source_provider = "massive"
-                    except Exception as exc:
+                    except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                        logger.warning("Massive fetch failed for %s: %s", clean_symbol, exc)
                         provider_errors.append(f"massive: {exc}")
 
             if not rows:
@@ -502,7 +510,8 @@ def import_data_files(req: DataImportRequest):
 
             imported.append(DataImportResult(symbol=clean_symbol, filename=filename, bars=len(rows)))
 
-        except Exception as exc:
+        except (RuntimeError, OSError, ValueError) as exc:
+            logger.error("Data import failed for %s: %s", clean_symbol, exc)
             failed.append(DataImportResult(symbol=clean_symbol, error=str(exc)))
 
     return DataImportResponse(
@@ -512,10 +521,12 @@ def import_data_files(req: DataImportRequest):
     )
 
 
-@app.post("/backtest/run", response_model=BacktestResponse)
-def run_backtest(req: BacktestRequest):
-    """Run a backtest and return results as JSON."""
+def _execute_backtest(req: BacktestRequest) -> dict:
+    """Core backtest logic shared by JSON and CSV endpoints.
 
+    Returns a dict with all result fields.
+    Raises HTTPException on validation errors, or re-raises engine errors.
+    """
     use_custom_strategy = req.strategy == "custom" or bool((req.custom_strategy_code or "").strip())
 
     # Validate strategy
@@ -621,35 +632,39 @@ def run_backtest(req: BacktestRequest):
                         "date": str(d.date()),
                         "value": round(v, 2),
                     })
-                except Exception:
-                    pass
+                except (IndexError, ValueError, TypeError) as exc:
+                    logger.debug("Skipping portfolio value at index %d: %s", i, exc)
 
         # Analyzers
         analyzers = {}
         try:
             sharpe = strat_result.analyzers.sharpe.get_analysis()
             analyzers["sharpe_ratio"] = round(sharpe.get("sharperatio", 0) or 0, 4)
-        except Exception:
+        except (AttributeError, KeyError, TypeError) as exc:
+            logger.warning("Failed to extract Sharpe ratio: %s", exc)
             analyzers["sharpe_ratio"] = None
 
         try:
             dd = strat_result.analyzers.drawdown.get_analysis()
             analyzers["max_drawdown_pct"] = round(dd.get("max", {}).get("drawdown", 0), 2)
             analyzers["max_drawdown_len"] = dd.get("max", {}).get("len", 0)
-        except Exception:
+        except (AttributeError, KeyError, TypeError) as exc:
+            logger.warning("Failed to extract drawdown: %s", exc)
             analyzers["max_drawdown_pct"] = None
 
         try:
             ret = strat_result.analyzers.returns.get_analysis()
             analyzers["total_return_pct"] = round(ret.get("rtot", 0) * 100, 2)
-        except Exception:
+        except (AttributeError, KeyError, TypeError) as exc:
+            logger.warning("Failed to extract returns: %s", exc)
             analyzers["total_return_pct"] = None
 
         try:
             sqn = strat_result.analyzers.sqn.get_analysis()
             analyzers["sqn"] = round(sqn.get("sqn", 0) or 0, 4)
             analyzers["sqn_trades"] = sqn.get("trades", 0)
-        except Exception:
+        except (AttributeError, KeyError, TypeError) as exc:
+            logger.warning("Failed to extract SQN: %s", exc)
             analyzers["sqn"] = None
 
         try:
@@ -660,27 +675,104 @@ def run_backtest(req: BacktestRequest):
                 "lost": ta.get("lost", {}).get("total", 0),
                 "pnl_net_total": round(ta.get("pnl", {}).get("net", {}).get("total", 0), 2),
             }
-        except Exception:
+        except (AttributeError, KeyError, TypeError) as exc:
+            logger.warning("Failed to extract trade analysis: %s", exc)
             analyzers["trade_analysis"] = None
 
-        return BacktestResponse(
-            success=True,
-            strategy=req.strategy,
-            starting_cash=req.cash,
-            final_value=round(final_value, 2),
-            profit=round(profit, 2),
-            profit_pct=round(profit_pct, 2),
-            total_trades=len(trades),
-            trades=trades,
-            portfolio_values=portfolio_values,
-            analyzers=analyzers,
-        )
+        return {
+            "success": True,
+            "strategy": req.strategy,
+            "starting_cash": req.cash,
+            "final_value": round(final_value, 2),
+            "profit": round(profit, 2),
+            "profit_pct": round(profit_pct, 2),
+            "total_trades": len(trades),
+            "trades": trades,
+            "portfolio_values": portfolio_values,
+            "analyzers": analyzers,
+        }
 
     except HTTPException:
         raise
     except Exception as e:
-        traceback.print_exc()
+        logger.exception("Backtest failed for strategy '%s'", req.strategy)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/backtest/run", response_model=BacktestResponse)
+def run_backtest(req: BacktestRequest):
+    """Run a backtest and return results as JSON."""
+    return BacktestResponse(**_execute_backtest(req))
+
+
+@app.post("/backtest/export/csv")
+def export_backtest_csv(req: BacktestRequest):
+    """Run a backtest and return results as a downloadable CSV file.
+
+    The CSV contains three sections separated by blank rows:
+    1. Summary — strategy name, cash, profit, analyzer metrics
+    2. Trades — one row per executed trade
+    3. Portfolio — daily portfolio value
+    """
+    result = _execute_backtest(req)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+
+    # --- Section 1: Summary ---
+    writer.writerow(["# Summary"])
+    writer.writerow(["Strategy", result["strategy"]])
+    writer.writerow(["Starting Cash", result["starting_cash"]])
+    writer.writerow(["Final Value", result["final_value"]])
+    writer.writerow(["Profit", result["profit"]])
+    writer.writerow(["Profit %", result["profit_pct"]])
+    writer.writerow(["Total Trades", result["total_trades"]])
+
+    analyzers = result.get("analyzers", {})
+    writer.writerow(["Sharpe Ratio", analyzers.get("sharpe_ratio", "")])
+    writer.writerow(["Max Drawdown %", analyzers.get("max_drawdown_pct", "")])
+    writer.writerow(["Max Drawdown Length", analyzers.get("max_drawdown_len", "")])
+    writer.writerow(["Total Return %", analyzers.get("total_return_pct", "")])
+    writer.writerow(["SQN", analyzers.get("sqn", "")])
+    writer.writerow(["SQN Trades", analyzers.get("sqn_trades", "")])
+
+    ta = analyzers.get("trade_analysis")
+    if ta:
+        writer.writerow(["Closed Trades", ta.get("total_closed", "")])
+        writer.writerow(["Won", ta.get("won", "")])
+        writer.writerow(["Lost", ta.get("lost", "")])
+        writer.writerow(["PnL Net Total", ta.get("pnl_net_total", "")])
+
+    writer.writerow([])
+
+    # --- Section 2: Trades ---
+    writer.writerow(["# Trades"])
+    writer.writerow(["Datetime", "Type", "Price", "Size", "Value", "Commission"])
+    for trade in result.get("trades", []):
+        writer.writerow([
+            trade.get("datetime", ""),
+            trade.get("type", ""),
+            trade.get("price", ""),
+            trade.get("size", ""),
+            trade.get("value", ""),
+            trade.get("commission", ""),
+        ])
+
+    writer.writerow([])
+
+    # --- Section 3: Portfolio Values ---
+    writer.writerow(["# Portfolio Values"])
+    writer.writerow(["Date", "Value"])
+    for pv in result.get("portfolio_values", []):
+        writer.writerow([pv.get("date", ""), pv.get("value", "")])
+
+    buf.seek(0)
+    filename = f"backtest-{result['strategy']}-{datetime.date.today().isoformat()}.csv"
+    return StreamingResponse(
+        buf,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +781,11 @@ def run_backtest(req: BacktestRequest):
 if __name__ == "__main__":
     import uvicorn
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+
     port = int(os.environ.get("RAINFACE_BT_PORT", 8420))
-    print(f"🚀 Rainface Backtrader API starting on http://0.0.0.0:{port}")
+    logger.info("Rainface Backtrader API starting on http://0.0.0.0:%d", port)
     uvicorn.run(app, host="0.0.0.0", port=port)
