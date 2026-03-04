@@ -1,0 +1,28 @@
+# =============================================================================
+# Rainface Backtrader Sandbox — Custom Strategy Isolation
+# =============================================================================
+# Minimal image for running untrusted custom strategy code in a throwaway
+# container with NO network access, read-only filesystem, and resource limits.
+#
+# Usage (from server.py):
+#   docker run --rm --network=none --read-only --memory=512m --cpus=1 \
+#       --tmpfs /tmp:size=64m \
+#       rainface-sandbox < job.json
+# =============================================================================
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install only the essential Python deps for backtrader
+RUN pip install --no-cache-dir pandas
+
+# Copy the backtrader library and the sandbox runner
+COPY backtrader/ /app/backtrader/
+COPY sandbox_runner.py /app/sandbox_runner.py
+
+# Run as a non-root user for extra safety
+RUN useradd --create-home --shell /bin/false sandbox
+USER sandbox
+
+ENTRYPOINT ["python", "/app/sandbox_runner.py"]

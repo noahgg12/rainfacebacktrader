@@ -14,6 +14,7 @@ import re
 import threading
 import types
 import datetime
+import subprocess
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -33,6 +34,54 @@ from fastapi.responses import StreamingResponse
 from strategies import STRATEGY_REGISTRY
 
 logger = logging.getLogger("rainface.backtrader")
+
+# ---------------------------------------------------------------------------
+# Docker sandbox configuration
+# ---------------------------------------------------------------------------
+SANDBOX_IMAGE = "rainface-sandbox:latest"
+SANDBOX_TIMEOUT_SECONDS = 120
+SANDBOX_MEMORY_LIMIT = "512m"
+SANDBOX_CPUS = 1.0
+
+
+def _is_docker_available() -> bool:
+    """Check if Docker is available for sandbox execution."""
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _is_sandbox_image_built() -> bool:
+    """Check if the sandbox Docker image exists."""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", SANDBOX_IMAGE],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+_docker_available: bool | None = None
+_sandbox_ready: bool | None = None
+
+
+def _check_sandbox_status() -> tuple[bool, bool]:
+    """Return (docker_available, sandbox_ready) with caching."""
+    global _docker_available, _sandbox_ready
+    if _docker_available is None:
+        _docker_available = _is_docker_available()
+    if _docker_available and _sandbox_ready is None:
+        _sandbox_ready = _is_sandbox_image_built()
+    return _docker_available or False, _sandbox_ready or False
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -429,12 +478,102 @@ def _wrap_custom_strategy_with_trade_capture(strategy_cls: type[bt.Strategy]) ->
     return RainfaceWrappedStrategy
 
 
+def _run_custom_strategy_in_sandbox(req: "BacktestRequest", csv_data: str) -> dict:
+    """Run a custom strategy inside an isolated Docker container.
+
+    The container has:
+      - No network access (--network=none)
+      - Read-only filesystem (--read-only)
+      - Limited memory and CPU
+      - A timeout to prevent infinite loops
+    """
+    # Build the job payload
+    job = {
+        "custom_strategy_code": req.custom_strategy_code,
+        "custom_strategy_class": req.custom_strategy_class,
+        "csv_data": csv_data,
+        "cash": req.cash,
+        "commission": req.commission,
+        "stake": req.stake,
+        "fromdate": req.fromdate,
+        "todate": req.todate,
+        "strategy_params": req.strategy_params,
+    }
+    job_json = json.dumps(job)
+
+    cmd = [
+        "docker", "run",
+        "--rm",                                   # auto-remove container
+        "--network=none",                          # no network access
+        "--read-only",                             # read-only filesystem
+        f"--memory={SANDBOX_MEMORY_LIMIT}",        # memory limit
+        f"--cpus={SANDBOX_CPUS}",                  # CPU limit
+        "--tmpfs", "/tmp:size=64m",                # small writable /tmp
+        "-i",                                      # keep stdin open
+        SANDBOX_IMAGE,
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=job_json,
+            capture_output=True,
+            text=True,
+            timeout=SANDBOX_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Custom strategy timed out after {SANDBOX_TIMEOUT_SECONDS}s.",
+        )
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()
+        # Try to parse structured error from sandbox_runner
+        try:
+            result = json.loads(proc.stdout)
+            if not result.get("success"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Custom strategy failed: {result.get('error', 'unknown error')}",
+                )
+        except (json.JSONDecodeError, TypeError):
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"Sandbox execution failed: {stderr[:500] if stderr else 'unknown error'}",
+        )
+
+    try:
+        result = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=500,
+            detail="Sandbox returned invalid JSON output.",
+        )
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Custom strategy failed: {result.get('error', 'unknown error')}",
+        )
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "engine": "backtrader", "version": bt.__version__}
+    docker_ok, sandbox_ok = _check_sandbox_status()
+    return {
+        "status": "ok",
+        "engine": "backtrader",
+        "version": bt.__version__,
+        "docker_available": docker_ok,
+        "sandbox_ready": sandbox_ok,
+    }
 
 
 @app.get("/strategies")
@@ -644,6 +783,18 @@ def _execute_backtest(req: BacktestRequest) -> dict:
 
         # Add strategy with params
         if use_custom_strategy:
+            # --- Sandbox path: run custom code in an isolated container ---
+            _, sandbox_ok = _check_sandbox_status()
+            if sandbox_ok:
+                logger.info("Running custom strategy in sandbox container")
+                csv_data = df.to_csv()
+                return _run_custom_strategy_in_sandbox(req, csv_data)
+
+            # --- Fallback: local exec (logged as warning) ---
+            logger.warning(
+                "Sandbox not available — running custom strategy locally. "
+                "Build the sandbox image with: docker build -f Dockerfile.sandbox -t rainface-sandbox ."
+            )
             try:
                 strat_cls = _load_custom_strategy_class(
                     code=req.custom_strategy_code or "",

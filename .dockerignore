@@ -1,0 +1,36 @@
+# Virtual environments
+.venv/
+env/
+
+# Git
+.git/
+.github/
+.gitignore
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+
+# IDE
+.idea/
+.claude/
+
+# Logs
+logs/
+
+# Samples and tests (not needed in production image)
+samples/
+tests/
+test_engine.py
+
+# macOS service files
+com.rainface.backtrader.plist
+install_service.sh
+
+# Misc
+*.bak
+*.swp
+*.swo
+.ipynb*

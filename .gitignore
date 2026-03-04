@@ -69,3 +69,9 @@ samples2/
 datas/*.py
 
 .idea/
+
+# Virtual env
+.venv/
+
+# Runtime logs
+logs/

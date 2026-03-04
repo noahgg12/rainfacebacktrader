@@ -1,0 +1,27 @@
+# =============================================================================
+# Rainface Backtrader — Docker Compose
+# =============================================================================
+# Usage:
+#   docker compose up -d          # start in background
+#   docker compose logs -f        # tail logs
+#   docker compose down           # stop
+#   docker compose build          # rebuild after code changes
+# =============================================================================
+
+services:
+  backtrader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rainface-backtrader
+    ports:
+      - "8420:8420"
+    volumes:
+      # Persist data files and logs on the host
+      - ./datas:/app/datas
+      - ./logs:/app/logs
+      # Mount Docker socket so server.py can launch sandbox containers
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - RAINFACE_BT_PORT=8420
+    restart: unless-stopped
