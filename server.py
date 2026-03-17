@@ -1011,6 +1011,7 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
 
-    port = int(os.environ.get("RAINFACE_BT_PORT", 8420))
+    # Check standard PORT env var first (e.g., for Railway), fallback to custom env var
+    port = int(os.environ.get("PORT", os.environ.get("RAINFACE_BT_PORT", 8420)))
     logger.info("Rainface Backtrader API starting on http://0.0.0.0:%d", port)
     uvicorn.run(app, host="0.0.0.0", port=port)
